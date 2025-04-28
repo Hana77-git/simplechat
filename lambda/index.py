@@ -4,7 +4,79 @@ import os
 import boto3
 import re  # 正規表現モジュールをインポート
 from botocore.exceptions import ClientError
+import urllib.request
+import time
 
+
+class LLMClient:
+    """LLM API クライアントクラス"""
+    
+    def __init__(self, api_url):
+        """
+        初期化
+        
+        Args:
+            api_url (str): API のベース URL（ngrok URL）
+        """
+        self.api_url = api_url.rstrip('/')
+    
+    def health_check(self):
+        """
+        ヘルスチェック
+        
+        Returns:
+            dict: ヘルスチェック結果
+        """
+        url = f"{self.api_url}/health"
+        req = urllib.request.Request(url, method="GET")
+        
+        try:
+            with urllib.request.urlopen(req) as response:
+                resp_data = response.read()
+                return json.loads(resp_data.decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            raise Exception(f"API error: {e.code} - {e.reason}")
+    
+    def generate(self, prompt, max_new_tokens=512, temperature=0.7, top_p=0.9, do_sample=True):
+        """
+        テキスト生成
+        
+        Args:
+            prompt (str): プロンプト文字列
+            max_new_tokens (int, optional): 生成する最大トークン数
+            temperature (float, optional): 温度パラメータ
+            top_p (float, optional): top-p サンプリングのパラメータ
+            do_sample (bool, optional): サンプリングを行うかどうか
+        
+        Returns:
+            dict: 生成結果
+        """
+        url = f"{self.api_url}/generate"
+        payload = {
+            "prompt": prompt,
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "do_sample": do_sample
+        }
+        data = json.dumps(payload).encode('utf-8')
+        headers = {
+            'Content-Type': 'application/json'
+        }
+        
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        
+        start_time = time.time()
+        try:
+            with urllib.request.urlopen(req) as response:
+                resp_data = response.read()
+                total_time = time.time() - start_time
+                result = json.loads(resp_data.decode('utf-8'))
+                result["total_request_time"] = total_time
+                return result
+        except urllib.error.HTTPError as e:
+            error_message = e.read().decode()
+            raise Exception(f"API error: {e.code} - {error_message}")
 
 # Lambda コンテキストからリージョンを抽出する関数
 def extract_region_from_arn(arn):
@@ -17,8 +89,8 @@ def extract_region_from_arn(arn):
 # グローバル変数としてクライアントを初期化（初期値）
 bedrock_client = None
 
-# モデルID
-MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
+# API URL
+NGROK_URL = "https://ed29-34-105-37-108.ngrok-free.app/"
 
 def lambda_handler(event, context):
     try:
@@ -40,71 +112,18 @@ def lambda_handler(event, context):
         # リクエストボディの解析
         body = json.loads(event['body'])
         message = body['message']
-        conversation_history = body.get('conversationHistory', [])
-        
         print("Processing message:", message)
-        print("Using model:", MODEL_ID)
+
+        client = LLMClient(NGROK_URL)
+        print("Health check:")
+        print(client.health_check())
         
-        # 会話履歴を使用
-        messages = conversation_history.copy()
-        
-        # ユーザーメッセージを追加
-        messages.append({
-            "role": "user",
-            "content": message
-        })
-        
-        # Nova Liteモデル用のリクエストペイロードを構築
-        # 会話履歴を含める
-        bedrock_messages = []
-        for msg in messages:
-            if msg["role"] == "user":
-                bedrock_messages.append({
-                    "role": "user",
-                    "content": [{"text": msg["content"]}]
-                })
-            elif msg["role"] == "assistant":
-                bedrock_messages.append({
-                    "role": "assistant", 
-                    "content": [{"text": msg["content"]}]
-                })
-        
-        # invoke_model用のリクエストペイロード
-        request_payload = {
-            "messages": bedrock_messages,
-            "inferenceConfig": {
-                "maxTokens": 512,
-                "stopSequences": [],
-                "temperature": 0.7,
-                "topP": 0.9
-            }
-        }
-        
-        print("Calling Bedrock invoke_model API with payload:", json.dumps(request_payload))
-        
-        # invoke_model APIを呼び出し
-        response = bedrock_client.invoke_model(
-            modelId=MODEL_ID,
-            body=json.dumps(request_payload),
-            contentType="application/json"
-        )
-        
-        # レスポンスを解析
-        response_body = json.loads(response['body'].read())
-        print("Bedrock response:", json.dumps(response_body, default=str))
-        
-        # 応答の検証
-        if not response_body.get('output') or not response_body['output'].get('message') or not response_body['output']['message'].get('content'):
-            raise Exception("No response content from the model")
-        
-        # アシスタントの応答を取得
-        assistant_response = response_body['output']['message']['content'][0]['text']
-        
-        # アシスタントの応答を会話履歴に追加
-        messages.append({
-            "role": "assistant",
-            "content": assistant_response
-        })
+        result = client.generate(message)
+        response = result['generated_text']
+        print(f"Response: {response}")
+        print(f"Model processing time: {result['response_time']:.2f}s")
+        print(f"Total request time: {result['total_request_time']:.2f}s")
+
         
         # 成功レスポンスの返却
         return {
@@ -117,8 +136,7 @@ def lambda_handler(event, context):
             },
             "body": json.dumps({
                 "success": True,
-                "response": assistant_response,
-                "conversationHistory": messages
+                "response": response,
             })
         }
         
